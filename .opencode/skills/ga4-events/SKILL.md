@@ -9,6 +9,11 @@ Analyze the raw GA4 event export in BigQuery and classify each `event_name`
 as **indicative/useful** or **noise**, build a conversion funnel, and audit
 event hygiene. Parameterized so it works on any GA4 export.
 
+> **Read `reference/sql-templates.md` in this skill's directory before
+> querying.** It is the single source of truth for the quality-gate, dedupe,
+> and coverage SQL plus the PASS/FAIL thresholds and scoring matrix, shared
+> with `ga4-tracking-audit`. Edit templates there, never inline in a SKILL.md.
+
 ## Parameters (substitute per run)
 
 - `{project_id}` — billing project / where the export lives
@@ -51,99 +56,37 @@ WHERE table_name LIKE 'events_%' ORDER BY ordinal_position
 
 Verify the data passes these checks before reporting any rate. If a check
 fails, report it — never silently present funnel numbers on unclean data.
+All SQL lives in **`reference/sql-templates.md`** (Read it). Summary:
 
 1. **Duplicate check** — GA4 export is at-least-once delivery, so
-   duplicates inflate counts:
-   ```sql
-   SELECT COUNT(*) AS events,
-          COUNT(DISTINCT CONCAT(CAST(event_timestamp AS STRING), '|', event_name,
-                                CAST(event_bundle_sequence_id AS STRING), '|', user_pseudo_id)) AS distinct_keys
-   FROM `{project_id}.{dataset}.events_*`
-   WHERE _TABLE_SUFFIX BETWEEN '{start}' AND '{end}'
-   ```
-   - dup rate = (events - distinct_keys) / events. If > 0.5%, use the dedupe
-     pattern below in every downstream query.
+   duplicates inflate counts (`reference/sql-templates.md` §1a):
+   - dup rate = (events - distinct_keys) / events. **PASS ≤ 0.5%**; above
+     that, use the dedupe pattern (§2) in every downstream query.
    - If `event_bundle_sequence_id` is absent from the schema, drop it from the key.
 
-2. **Null / join-key check**:
-   ```sql
-   SELECT COUNT(*) AS events,
-          COUNTIF(user_pseudo_id IS NULL) AS null_pseudo_id,
-          COUNTIF((SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') IS NULL) AS null_session,
-          COUNTIF(ARRAY_LENGTH(event_params) = 0) AS zero_params,
-          COUNTIF(user_id IS NOT NULL) AS with_user_id
-   FROM `{project_id}.{dataset}.events_*`
-   WHERE _TABLE_SUFFIX BETWEEN '{start}' AND '{end}'
-   ```
-   - `null_pseudo_id` or `null_session` share > 0.5% → user/session join keys
-     are broken; report the defect, don't proceed as if sessions are complete.
+2. **Null / join-key check** (`reference/sql-templates.md` §1b):
+   - **PASS if null_pseudo_id and null_session shares ≤ 0.5%**; above that,
+     the user/session join keys are broken — report the defect, don't proceed
+     as if sessions are complete.
    - High `zero_params` on purchase/checkout events → missing tracking, not a
      funnel signal.
    - `with_user_id` = 0 → the export has **no cross-device identity**; every
      user-level number counts cookies, not people. State this whenever you
-     report user-based rates (and re-check for thelook-style tables where
-     `user_id` may only exist on buyers).
+     report user-based rates (and re-check for tables where `user_id` may
+     only exist on buyers).
 
-3. **Session integrity**:
-   ```sql
-   WITH per_session AS (
-     SELECT (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS session_id,
-            COUNT(*) AS events, COUNT(DISTINCT event_name) AS types
-     FROM `{project_id}.{dataset}.events_*`
-     WHERE _TABLE_SUFFIX BETWEEN '{start}' AND '{end}'
-       AND (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') IS NOT NULL
-     GROUP BY session_id
-   )
-   SELECT COUNT(*) AS sessions, AVG(events) AS avg_events,
-          COUNTIF(events = 1) AS single_event_sessions, MAX(events) AS max_events
-   FROM per_session
-   ```
-   - Very high share of single-event sessions or an absurd `max_events` →
+3. **Session integrity** (`reference/sql-templates.md` §1c):
+   - **PASS if single-event share ≤ 10% and >100-event share ≤ 5%.** Otherwise
      sessionization is broken (fragmented or merged sessions); sessions cannot
      be trusted for funnels.
 
-**Dedupe pattern for downstream queries** (use whenever dup rate > 0.5%):
-
-```sql
-WITH events_dedup AS (
-  SELECT * EXCEPT(rn) FROM (
-    SELECT *, ROW_NUMBER() OVER (
-      PARTITION BY event_timestamp, event_name, event_bundle_sequence_id, user_pseudo_id
-    ) AS rn
-    FROM `{project_id}.{dataset}.events_*`
-    WHERE _TABLE_SUFFIX BETWEEN '{start}' AND '{end}'
-  ) WHERE rn = 1
-)
-SELECT ... FROM events_dedup ...
-```
-
-For non-GA4 sources (e.g. custom event tables), adapt the dedupe key to the
-columns that uniquely identify a row, and the join-key checks to their
-user/session columns.
-
 ## Parameter & items coverage (tracking completeness)
 
-Zero-param counts hide *partial* tracking. Run a required-param coverage
-matrix per event to find steps that fire but carry no product/value data:
-
-```sql
-SELECT event_name,
-  COUNT(*) AS n,
-  COUNTIF(ARRAY_LENGTH(items) > 0) AS with_items,
-  COUNTIF((SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'currency') IS NOT NULL) AS with_currency,
-  COUNTIF((SELECT value.double_value FROM UNNEST(event_params) WHERE key = 'value') IS NOT NULL
-       OR (SELECT value.float_value  FROM UNNEST(event_params) WHERE key = 'value') IS NOT NULL) AS with_value,
-  COUNTIF((SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'transaction_id') IS NOT NULL) AS with_transaction_id,
-  COUNTIF((SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'search_term') IS NOT NULL) AS with_search_term
-FROM `{project_id}.{dataset}.events_*`
-WHERE _TABLE_SUFFIX BETWEEN '{start}' AND '{end}'
-  AND event_name IN ('view_item','view_item_list','select_item','add_to_cart',
-                     'remove_from_cart','begin_checkout','add_shipping_info',
-                     'add_payment_info','purchase','refund','search','view_search_results')
-GROUP BY event_name ORDER BY n DESC
-```
-
-Expected coverage (treat shortfalls as tracking defects, not behavior):
+Zero-param counts hide *partial* tracking. Run the required-param coverage
+matrix from **`reference/sql-templates.md` §3** per event to find steps that
+fire but carry no product/value data, and compare against the expected-param
+matrix (§4). Expected coverage (treat shortfalls as tracking defects, not
+behavior):
 
 - `items` on every commerce step: `view_item`/`view_item_list`/`select_item`,
   `add_to_cart`/`remove_from_cart`, `begin_checkout`/`add_shipping_info`/
@@ -156,10 +99,11 @@ Expected coverage (treat shortfalls as tracking defects, not behavior):
 - `transaction_id` on `purchase`/`refund`.
 - `search_term` on `search`/`view_search_results`.
 
-Also check **list-impression vs click consistency**: `view_item_list` (and
-`select_item`/`view_item`) should show list impressions ≥ clicks ≥ item views.
-If `view_item_list` is ~0 while `select_item`/`view_item` are large, list
-impressions are untracked and category/list-level analysis is blind.
+Also check **list-impression vs click consistency** (`reference/sql-templates.md`
+§6): `view_item_list` (and `select_item`/`view_item`) should show list
+impressions ≥ clicks ≥ item views. **FAIL if `view_item_list` < 10% of
+`select_item`** — list impressions are untracked and category/list-level
+analysis is blind.
 
 ## Attribution artifacts to flag
 
@@ -197,7 +141,7 @@ impressions are untracked and category/list-level analysis is blind.
 ## Workflow
 
 1. **Cost-safe setup**: pick the date window; dry-run the first query.
-2. **Quality gate**: run the duplicate / null-key / session-integrity checks above. Record PASS/FAIL for each. If the dup rate > 0.5%, run the rest of the workflow against the dedupe pattern.
+2. **Quality gate**: run the duplicate / null-key / session-integrity checks from `reference/sql-templates.md` §1. Record PASS/FAIL for each. If the dup rate > 0.5%, run the rest of the workflow against the dedupe pattern (§2).
 3. **Event inventory**:
    ```sql
    SELECT event_name, COUNT(*) AS n, COUNT(DISTINCT user_pseudo_id) AS users,

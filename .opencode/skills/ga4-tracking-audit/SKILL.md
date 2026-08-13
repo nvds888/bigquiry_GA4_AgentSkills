@@ -17,6 +17,11 @@ defects, so audit before you report funnels.
 Depends on `ga4-events` for the schema reference and cost-safety rules. Load
 it first and reuse its templates.
 
+> **All shared SQL, thresholds, and the scoring matrix live in
+> `.opencode/skills/ga4-events/reference/sql-templates.md`** (single source of
+> truth for both skills) — Read it before querying. Section numbers below
+> refer to that file.
+
 ## Parameters
 
 Same as `ga4-events`: `{project_id}`, `{dataset}`, `{start}`, `{end}`.
@@ -26,84 +31,57 @@ Same as `ga4-events`: `{project_id}`, `{dataset}`, `{start}`, `{end}`.
 1. **Cost-safe setup**: date-window filter on `_TABLE_SUFFIX`, dry-run,
    `--maximum_bytes_billed`. Same rules as `ga4-events`.
 2. **Quality gate**: run the dup / null-key / session-integrity checks from
-   `ga4-events`. Record PASS/FAIL. If dup rate > 0.5%, run every query below
-   against the `events_dedup` CTE.
+   `reference/sql-templates.md` §1. Record PASS/FAIL. If dup rate > 0.5%, run
+   every query below against the dedupe pattern (§2).
 3. **Recommended-event presence**: expected GA4 recommended events vs the
    inventory. Each missing event hides a funnel stage. Standard ecommerce set:
    `session_start`, `first_visit`, `view_item_list`, `view_item`,
    `select_item`, `add_to_cart`, `remove_from_cart`, `view_cart`,
    `begin_checkout`, `add_shipping_info`, `add_payment_info`, `purchase`,
    `refund`, `search`, `select_promotion`, `view_promotion`.
-4. **Required-param coverage matrix** (SQL below): which events fire but lack
-   the params they must carry. Report coverage % per event.
-5. **`items`-array integrity** (SQL below): coverage per commerce step, plus
-   list-impression vs click consistency (`view_item_list` vs `select_item`).
+4. **Required-param coverage matrix**: run the SQL in `reference/sql-templates.md`
+   §3 and compare against the expected-param matrix (§4). Report coverage % per event.
+5. **`items`-array integrity**: run the SQL in §5, plus list-impression vs
+   click consistency (§6: `view_item_list` vs `select_item`).
 6. **Duplicate / renamed events**: same semantic event under multiple names
    (e.g. `addtocart` + `add_to_cart`), custom events duplicating recommended
    ones (same `page_location`), events that look like debug/bucket leftovers.
 7. **Session anomalies**: single-event share, sessions > 100 events, missing
-   `session_start`, broken `ga_session_id` (see `ga4-events` quality gate).
+   `session_start`, broken `ga_session_id` (see §1c).
 8. **Score + fix list** (see Scoring and Fix routing below).
 
 ## Scoring (tracking health)
 
 Health score = `100 * (params present / params expected)` summed over the
-expected events for the property type (web ecommerce vs app vs SaaS). Report:
+expected events for the property type (web ecommerce vs app vs SaaS). The
+expected-param matrix and the scoring rule ("a param counts as present only at
+≥ 95% coverage") are defined in `reference/sql-templates.md` §4, with a worked
+example in §7. Report:
 
 - overall score;
 - per-event coverage table (`event | expected params | % complete | defect`);
 - anything < 100% on a commerce event is a **defect**, not a behavior — it
   silently truncates funnels and revenue attribution.
 
-## SQL: required-param coverage matrix
+### Explicit PASS/FAIL thresholds (from `reference/sql-templates.md`)
 
-```sql
-SELECT event_name,
-  COUNT(*) AS n,
-  COUNTIF(ARRAY_LENGTH(items) > 0) AS with_items,
-  COUNTIF((SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'currency') IS NOT NULL) AS with_currency,
-  COUNTIF((SELECT value.double_value FROM UNNEST(event_params) WHERE key = 'value') IS NOT NULL
-       OR (SELECT value.float_value  FROM UNNEST(event_params) WHERE key = 'value') IS NOT NULL) AS with_value,
-  COUNTIF((SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'transaction_id') IS NOT NULL) AS with_transaction_id,
-  COUNTIF((SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'search_term') IS NOT NULL) AS with_search_term,
-  COUNTIF((SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'item_list_name') IS NOT NULL) AS with_item_list_name
-FROM `{project_id}.{dataset}.events_*`
-WHERE _TABLE_SUFFIX BETWEEN '{start}' AND '{end}'
-  AND event_name IN ('view_item','view_item_list','select_item','add_to_cart',
-                     'remove_from_cart','view_cart','begin_checkout',
-                     'add_shipping_info','add_payment_info','purchase','refund',
-                     'search','view_search_results','view_promotion','select_promotion')
-GROUP BY event_name ORDER BY n DESC
-```
+| check | rule |
+| --- | --- |
+| duplicates | **PASS ≤ 0.5%** dup rate; above → dedupe before all analysis |
+| null join keys | **PASS ≤ 0.5%** for `user_pseudo_id` and `session` null share |
+| sessionization | **PASS** single-event share ≤ 10% and >100-event share ≤ 5% |
+| `items` coverage | **DEFECT** < 95% on any commerce event (0% = structural) |
+| `currency`/`value`/`transaction_id` | **DEFECT** < 95% on the events that require them |
+| list impressions | **FAIL** if `view_item_list` < 10% of `select_item` |
+| `user_id` | note when 0 rows carry it → all user numbers are cookie-based |
 
-## SQL: items-array integrity
+### Worked example — `ga4_obfuscated_sample_ecommerce`, Nov–Dec 2020
 
-```sql
-SELECT event_name, COUNT(*) AS n,
-  COUNTIF(ARRAY_LENGTH(items) > 0) AS with_items,
-  ROUND(100 * COUNTIF(ARRAY_LENGTH(items) > 0) / COUNT(*), 1) AS pct_with_items,
-  ROUND(SUM(ARRAY_LENGTH(items)) / COUNT(*), 2) AS avg_items
-FROM `{project_id}.{dataset}.events_*`
-WHERE _TABLE_SUFFIX BETWEEN '{start}' AND '{end}'
-  AND event_name IN ('view_item','view_item_list','select_item','add_to_cart',
-                     'begin_checkout','add_shipping_info','add_payment_info','purchase')
-GROUP BY event_name ORDER BY n DESC
-```
-
-List-impression consistency:
-
-```sql
-SELECT
-  SUM(IF(event_name = 'view_item_list', 1, 0)) AS list_impressions,
-  SUM(IF(event_name = 'select_item', 1, 0)) AS item_clicks,
-  SUM(IF(event_name = 'view_item', 1, 0)) AS item_views
-FROM `{project_id}.{dataset}.events_*`
-WHERE _TABLE_SUFFIX BETWEEN '{start}' AND '{end}'
-```
-
-Rule: impressions ≥ clicks ≥ views. `view_item_list` near zero while
-`select_item`/`view_item` are large → list impressions are untracked (blind
-category/list analysis).
+`view_item` 59% items, `add_to_cart` 100% items, `begin_checkout` 72% items,
+`add_shipping_info`/`add_payment_info` 0% items, `purchase` value 63% /
+transaction_id 86%, `view_item_list` 68% items + only 62 events vs 17,291
+`select_item` → **health ≈ 45%** on that run (see §7 for the table). Every row
+in that table maps to a GTM/code fix below.
 
 ## Fix routing (GTM vs app code)
 

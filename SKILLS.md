@@ -2,8 +2,7 @@
 
 This workspace contains a set of **opencode skills** for analyzing event / web-analytics
 data in BigQuery. They are **agnostic to the dataset** — you can point them at any
-BigQuery export (GA4 raw export, a flat events table, or the public
-`thelook_ecommerce` demo dataset) by supplying a few parameters.
+BigQuery export (GA4 raw export or a flat events table) by supplying a few parameters.
 
 ## The skills (agents)
 
@@ -12,9 +11,8 @@ BigQuery export (GA4 raw export, a flat events table, or the public
 | `ga4-tracking-audit` | Checks whether the data is **trustworthy** before any analysis: required-parameter coverage matrix, `items`-array integrity, missing recommended events, duplicate/orphan events, session anomalies | GA4 `events_*` exports | Tracking health score + prioritized fix list (GTM vs code vs schema) |
 | `ga4-events` | Classifies each event as indicative vs noise, builds the **session funnel**, recommends events to add/fix/remove | GA4 `events_*` exports | Funnel + event recommendations + data gaps |
 | `ga4-segmentation` | Runs the funnel **per segment** (traffic source, device, geo, new vs returning) to find over-/under-performers | GA4 `events_*` exports (depends on `ga4-events`) | Segment x funnel tables + best/worst segments |
-| `thelook-events` | Classifies events + funnel + cancellation diagnosis on the public **thelook_ecommerce** demo dataset | `bigquery-public-data.thelook_ecommerce.events` | Classification + funnel + data gaps |
 
-All four share a **standardized report format**:
+All three share a **standardized report format**:
 
 1. `Quality gate` — PASS/FAIL per data-quality check
 2. `Event inventory & classification`
@@ -27,7 +25,7 @@ All four share a **standardized report format**:
 | Your table looks like | Use |
 | --- | --- |
 | GA4 raw export (`event_name`, `event_params`, `items`, `traffic_source`, `device`, `geo`) | `ga4-tracking-audit` → `ga4-events` → `ga4-segmentation` |
-| Flat events table (`event_type`, `session_id`, `sequence_number`, `uri`) | `ga4-events` adapted (it has the generic templates) or `thelook-events` as a pattern |
+| Flat events table (`event_type`, `session_id`, `sequence_number`, `uri`) | `ga4-events` adapted (it has the generic templates) |
 | Anything else / unknown schema | Start with `ga4-tracking-audit`; run the schema check first |
 
 **Recommended pipeline (always):** audit the data's trustworthiness *before*
@@ -53,7 +51,7 @@ segment numbers.
 ```powershell
 bq ls <project_id>                       # list datasets
 bq ls <project_id>:<dataset>             # list tables
-bq ls bigquery-public-data:thelook_ecommerce   # e.g. public demo
+bq ls bigquery-public-data              # e.g. public datasets
 ```
 
 ### 3. Check the schema
@@ -92,13 +90,12 @@ $env:Path = "$env:LOCALAPPDATA\Google\Cloud SDK\google-cloud-sdk\bin;" + $env:Pa
 | --- | --- |
 | `ga4-tracking-audit` / `ga4-events` | `{project_id}`, `{dataset}`, `{start}`/`{end}` (YYYYMMDD) |
 | `ga4-segmentation` | same + `{segment_dim}` (source / device / geo / new vs returning) |
-| `thelook-events` | `{project_id}` only (table is public) |
 
 ### 6. Known data quirks to watch for (learned from real runs)
 
-- **`user_id` missing ≠ clean data.** On GA4 sample data it's empty (cookies
-  only); on thelook it exists *only on buyers* — per-user funnels are
-  meaningless in both cases. Always check.
+- **`user_id` missing ≠ clean data.** In many exports it's empty (cookies
+  only); in flat lookup-style tables it can exist *only on buyers* — per-user
+  funnels are meaningless in both cases. Always check.
 - **Zero-param counts hide partial tracking.** Events can fire but carry no
   `items`/`value`/`currency` (e.g. a checkout step with 0% items). The
   coverage matrix in `ga4-tracking-audit` catches this.
@@ -106,8 +103,8 @@ $env:Path = "$env:LOCALAPPDATA\Google\Cloud SDK\google-cloud-sdk\bin;" + $env:Pa
   and self-referral domains show inflated conversion — flag as noise, not wins.
 - **Flat segments are a finding.** If all segments deviate < ~2pp from
   baseline, the problem is site-wide, not segment-specific.
-- **Synthetic/template data** (like thelook) has rigid session shapes — verify
-  session patterns before trusting "behavioral" conclusions.
+- **Synthetic/template data** can have rigid session shapes — verify session
+  patterns before trusting "behavioral" conclusions.
 
 ## When the Gastronomixs data becomes available
 
