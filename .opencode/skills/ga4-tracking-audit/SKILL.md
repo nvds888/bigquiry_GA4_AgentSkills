@@ -24,7 +24,9 @@ it first and reuse its templates.
 
 ## Parameters
 
-Same as `ga4-events`: `{project_id}`, `{dataset}`, `{start}`, `{end}`.
+Same as `ga4-events`: `{project_id}`, `{dataset}`, `{start}`, `{end}`, plus
+`{property_type}` (`ecommerce` or `saas`) — selects the expected-event set and
+scoring matrix from `sql-templates.md` §4.
 
 ## Workflow
 
@@ -34,15 +36,28 @@ Same as `ga4-events`: `{project_id}`, `{dataset}`, `{start}`, `{end}`.
    `reference/sql-templates.md` §1. Record PASS/FAIL. If dup rate > 0.5%, run
    every query below against the dedupe pattern (§2).
 3. **Recommended-event presence**: expected GA4 recommended events vs the
-   inventory. Each missing event hides a funnel stage. Standard ecommerce set:
-   `session_start`, `first_visit`, `view_item_list`, `view_item`,
-   `select_item`, `add_to_cart`, `remove_from_cart`, `view_cart`,
-   `begin_checkout`, `add_shipping_info`, `add_payment_info`, `purchase`,
-   `refund`, `search`, `select_promotion`, `view_promotion`.
+   inventory. Each missing event hides a funnel stage.
+   - `{property_type} = ecommerce`: `session_start`, `first_visit`,
+     `view_item_list`, `view_item`, `select_item`, `add_to_cart`,
+     `remove_from_cart`, `view_cart`, `begin_checkout`, `add_shipping_info`,
+     `add_payment_info`, `purchase`,
+     `refund`, `search`, `select_promotion`, `view_promotion`.
+   - `{property_type} = saas`: `session_start`, `first_visit`, `sign_up` (or
+     `create_account`), `login`, `generate_lead`, `pricing_view`,
+     `start_trial`/`trial_started`, `subscribe` (or `purchase`), `upgrade`,
+     `cancel_subscription`, `refund`, `search`, `tutorial_complete`.
 4. **Required-param coverage matrix**: run the SQL in `reference/sql-templates.md`
-   §3 and compare against the expected-param matrix (§4). Report coverage % per event.
+   §3 and compare against the expected-param matrix (§4a for `ecommerce`, §4b
+   for `saas`). Report coverage % per event.
+   The §3 query reads `value` from `int_value`/`float_value`/`double_value` and the
+   `event_value_in_usd` column — don't downgrade to a single value type.
 5. **`items`-array integrity**: run the SQL in §5, plus list-impression vs
-   click consistency (§6: `view_item_list` vs `select_item`).
+   click consistency (§6: `view_item_list` vs `select_item`). Also run the
+   **§3b transaction-id hygiene check**: an `ecommerce.transaction_id` column
+   with cardinality 1 across a high-volume event is a constant placeholder
+   (see worked example) — flag it and exclude it from coverage, don't count it.
+   For `saas`, the parallel checks are `plan` + `value` + `currency` coverage
+   on `subscribe`/`start_trial` (§4b) instead of `items`.
 6. **Duplicate / renamed events**: same semantic event under multiple names
    (e.g. `addtocart` + `add_to_cart`), custom events duplicating recommended
    ones (same `page_location`), events that look like debug/bucket leftovers.
@@ -53,15 +68,15 @@ Same as `ga4-events`: `{project_id}`, `{dataset}`, `{start}`, `{end}`.
 ## Scoring (tracking health)
 
 Health score = `100 * (params present / params expected)` summed over the
-expected events for the property type (web ecommerce vs app vs SaaS). The
-expected-param matrix and the scoring rule ("a param counts as present only at
-≥ 95% coverage") are defined in `reference/sql-templates.md` §4, with a worked
-example in §7. Report:
+expected events for the property type. The expected-param matrix and the
+scoring rule ("a param counts as present only at ≥ 95% coverage") are defined
+in `reference/sql-templates.md` §4a (`ecommerce`) / §4b (`saas`), with a
+worked example in §7. Report:
 
 - overall score;
 - per-event coverage table (`event | expected params | % complete | defect`);
-- anything < 100% on a commerce event is a **defect**, not a behavior — it
-  silently truncates funnels and revenue attribution.
+- anything < 100% on a commerce/SaaS conversion event is a **defect**, not a
+  behavior — it silently truncates funnels and revenue attribution.
 
 ### Explicit PASS/FAIL thresholds (from `reference/sql-templates.md`)
 
@@ -77,10 +92,8 @@ example in §7. Report:
 
 ### Worked example — `ga4_obfuscated_sample_ecommerce`, Nov–Dec 2020
 
-`view_item` 59% items, `add_to_cart` 100% items, `begin_checkout` 72% items,
-`add_shipping_info`/`add_payment_info` 0% items, `purchase` value 63% /
-transaction_id 86%, `view_item_list` 68% items + only 62 events vs 17,291
-`select_item` → **health ≈ 45%** on that run (see §7 for the table). Every row
+`view_item` 59% items, `add_to_cart` 100% items but **0% value**, `begin_checkout` 72% items / 0% value, `add_shipping_info`/`add_payment_info` 0% items + 0% value, `purchase` value 97% / transaction_id ~99% (real distinct values; the `ecommerce.transaction_id` **column** is a cardinality-1 placeholder on every other event), `view_item_list` 68% items + only 62 events vs 17,291
+`select_item` → **health ≈ 41%** on that run (see §7 for the table). Every row
 in that table maps to a GTM/code fix below.
 
 ## Fix routing (GTM vs app code)

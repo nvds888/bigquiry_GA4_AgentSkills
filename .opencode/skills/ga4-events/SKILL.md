@@ -20,6 +20,9 @@ event hygiene. Parameterized so it works on any GA4 export.
 - `{dataset}` — e.g. `analytics_123456789`
 - `{table}` — GA4 export prefix: `events_*` (covers `events_YYYYMMDD` and `events_intraday_*`). Always filter with `_TABLE_SUFFIX BETWEEN '{start}' AND '{end}'`.
 - `{start}` / `{end}` — date window in YYYYMMDD, e.g. `'20260701'` .. `'20261001'`
+- `{property_type}` — `ecommerce` (default) or `saas`. Selects the funnel and
+  expected-param matrix. SaaS examples use `sign_up` → `pricing_view` →
+  `start_trial` → `subscribe`; adapt to the property's actual events.
 
 ## Reference schema (raw GA4 export, web)
 
@@ -47,8 +50,8 @@ WHERE table_name LIKE 'events_%' ORDER BY ordinal_position
 ## Cost-safety (always, before any query)
 
 - GA4 export is **date-partitioned**: always filter with `_TABLE_SUFFIX BETWEEN ...` or `event_date`. Never scan `events_*` unfiltered.
-- Run a **dry run** first to check bytes scanned before paying for the real run (see PowerShell pattern below).
-- Set `--maximum_bytes_billed` (e.g. 500000000 = 500 MB) so a runaway query fails instead of billing.
+- Run a **dry run** first to check bytes scanned before paying for the real run (see PowerShell pattern below). **Caveat:** a dry-run against a `events_*` wildcard can report `totalBytesProcessed: 0` (misleading) — the real run will scan the data, so still set a cap.
+- Set `--maximum_bytes_billed` so a runaway query fails instead of billing. **500 MB is too low for the wider checks** (null-key, session-integrity, coverage matrix on a multi-million-row export) — on `ga4_obfuscated_sample_ecommerce` (2.7M rows) those needed ~1–2 GB. Start at `--maximum_bytes_billed=2000000000` (2 GB) and tighten after seeing the first real-run byte count.
 - `SELECT` only needed columns; avoid `SELECT *` on wide exports.
 - Repeated identical queries hit the free 24h cache.
 
@@ -85,8 +88,8 @@ All SQL lives in **`reference/sql-templates.md`** (Read it). Summary:
 Zero-param counts hide *partial* tracking. Run the required-param coverage
 matrix from **`reference/sql-templates.md` §3** per event to find steps that
 fire but carry no product/value data, and compare against the expected-param
-matrix (§4). Expected coverage (treat shortfalls as tracking defects, not
-behavior):
+matrix (§4a `ecommerce` / §4b `saas`). Expected coverage (treat shortfalls as
+tracking defects, not behavior). For `{property_type} = ecommerce`:
 
 - `items` on every commerce step: `view_item`/`view_item_list`/`select_item`,
   `add_to_cart`/`remove_from_cart`, `begin_checkout`/`add_shipping_info`/
@@ -98,6 +101,12 @@ behavior):
   `event_value_in_usd` column).
 - `transaction_id` on `purchase`/`refund`.
 - `search_term` on `search`/`view_search_results`.
+
+For `{property_type} = saas`, use the §4b matrix instead: `method` on
+`sign_up`/`login`, `form_id` on `generate_lead`, `plan` + `currency` on
+`pricing_view`/`start_trial`/`subscribe`, `value` + `currency` +
+`transaction_id` on `subscribe`/`purchase`, `plan` + `reason` on
+`cancel_subscription`, and `search_term` on `search`/`view_search_results`.
 
 Also check **list-impression vs click consistency** (`reference/sql-templates.md`
 §6): `view_item_list` (and `select_item`/`view_item`) should show list
@@ -123,6 +132,7 @@ analysis is blind.
 - `add_to_cart`, `remove_from_cart`, `add_to_wishlist` — product-intent micro-steps.
 - `select_item`, `view_item`, `view_item_list` — which products get interest and convert.
 - `search` (with `search_term` param) — explicit intent; a strong conversion predictor.
+- `view_promotion` / `select_promotion` (with `promotion_id`/`creative_name`) — campaign-level engagement; pair them so impression→click can be measured.
 - `refund` (with amount) — negative outcome; return / cancellation risk.
 - SaaS/lead events: `sign_up`, `login`, `generate_lead`, `pricing_view`, `subscribe`, `tutorial_complete` (or equivalent onboarding events) — the macro funnel for SaaS.
 
@@ -151,7 +161,8 @@ analysis is blind.
    GROUP BY event_name ORDER BY n DESC
    ```
 4. **Map events to pages**: for each event_name, check the top `page_location` values to confirm what it fires on (finds misconfigured/duplicate events).
-5. **Session funnel** (adapt if `session_id` is a column vs the `ga_session_id` param):
+5. **Session funnel** (adapt if `session_id` is a column vs the `ga_session_id` param).
+   For `{property_type} = ecommerce` use this template:
    ```sql
    WITH funnel AS (
      SELECT
@@ -164,16 +175,33 @@ analysis is blind.
        MAX(IF(event_name = 'purchase', 1, 0)) AS s6
      FROM `{project_id}.{dataset}.events_*`
      WHERE _TABLE_SUFFIX BETWEEN '{start}' AND '{end}'
+       AND (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') IS NOT NULL
      GROUP BY session_id
    )
-   SELECT COUNT(*) AS sessions, SUM(s2) AS view_item, SUM(s3) AS add_to_cart,
-          SUM(s4) AS begin_checkout, SUM(s5) AS add_payment_info, SUM(s6) AS purchase
+   SELECT COUNT(*) AS sessions, SUM(s1) AS session_start, SUM(s2) AS view_item,
+          SUM(s3) AS add_to_cart, SUM(s4) AS begin_checkout,
+          SUM(s5) AS add_payment_info, SUM(s6) AS purchase
    FROM funnel
    ```
-   Report per-step drop-off and conversion rates (step n+1 / step n).
+   For `{property_type} = saas`, use the SaaS macro-funnel template in
+   `reference/sql-templates.md` §8 (`sign_up` → `pricing_view` → `start_trial`
+   → `subscribe`), and substitute the property's actual event names for any
+   step that differs.
+   Report per-step drop-off and conversion rates (step n+1 / step n). Always
+   report `session_start` as step 1 even when it equals sessions — it surfaces
+   `ga_session_id` coverage problems that silently skew the funnel. Keep
+   `IS NOT NULL` on `ga_session_id`: without it, NULL rows collapse into one
+   bogus "session" that inflates step 1.
+   **Step-through sanity check:** a mid-funnel step that retains >90% of the
+   previous step (e.g. add_to_cart → begin_checkout at 91%) is a red flag, not a
+   win — it usually means the step fires on page load of a checkout/cart page
+   rather than on the user action. Verify the event's trigger on its
+   `page_location` before reporting it as a real conversion step.
 6. **Hygiene audit**:
    - run the **parameter & items coverage matrix** (above) — the biggest
      source of "event exists but is useless" findings;
+   - run the **§3b transaction-id hygiene check** (constant-placeholder
+     `transaction_id` on high-volume events) from `reference/sql-templates.md`;
    - events with zero params (dead weight / missing tracking);
    - custom events that duplicate recommended GA4 events (both firing on the same `page_location`);
    - events with absurd cardinality or a single value (debug/bucket leftovers);
@@ -250,5 +278,5 @@ $env:Path = "$env:LOCALAPPDATA\Google\Cloud SDK\google-cloud-sdk\bin;" + $env:Pa
 
 - PowerShell **double-quoted** string + **doubled backticks** (``) for BigQuery identifiers.
 - SQL string literals with **single quotes** (`'20260701'`); double quotes get stripped by the cmd wrapper.
-- Dry run first: add `'--dry_run'` to see bytes scanned, then add `--maximum_bytes_billed=500000000` to the real run.
+- Dry run first: add `'--dry_run'` to see bytes scanned (may report 0 on a wildcard — still set a cap), then add `--maximum_bytes_billed=2000000000` (2 GB) to the real run.
 - Always pass `--project_id` (no default project is set).

@@ -16,7 +16,8 @@ first and reuse its templates and event inventory.
 ## Parameters
 
 Same as `ga4-events`: `{project_id}`, `{dataset}`, `{table}`, `{start}`,
-`{end}`. Plus `{segment_dim}` — one of the segment columns below.
+`{end}`, `{property_type}` (ecommerce/saas). Plus `{segment_dim}` — one of the
+segment columns below.
 
 ## Segment dimensions (default GA4 export)
 
@@ -30,7 +31,13 @@ Same as `ga4-events`: `{project_id}`, `{dataset}`, `{table}`, `{start}`,
 | marketing channel | (derived) classify from source/medium: Paid Search, Organic Search, Email, Direct, Referral, Paid Social |
 
 Confirm the segment column exists in the schema (see `ga4-events` step for
-checking `INFORMATION_SCHEMA.COLUMNS`) before querying.
+checking `INFORMATION_SCHEMA.COLUMNS`) before querying. **Also confirm it is
+populated on the events you segment with** — on some exports
+`traffic_source`/`device`/`geo` are NULL on a subset of rows (older exports),
+which silently drops sessions from the segment funnel. Run a quick NULL share
+per segment column and report it; if a segment column is only populated on one
+event type (e.g. `traffic_source` only on `session_start`), say so instead of
+segmenting on a column that's empty for most of the funnel.
 
 ### New vs returning users (concrete template)
 
@@ -65,12 +72,40 @@ Fallback if `ga_session_number` is absent: compare
 `event_timestamp - user_first_touch_timestamp` (first session < 30 min since
 first touch ≈ new) — label the result as approximate.
 
+### Segment column population guardrail
+
+Before trusting any segment comparison, check how populated the segment column
+actually is — a `traffic_source`/`device`/`geo` column that is NULL on a large
+share of rows will silently drop those sessions and skew every rate:
+
+```sql
+SELECT
+  COUNT(*) AS events,
+  COUNTIF(traffic_source.source IS NULL) AS null_source,
+  COUNTIF(device.category IS NULL) AS null_device,
+  COUNTIF(geo.country IS NULL) AS null_country,
+  COUNTIF(platform IS NULL) AS null_platform
+FROM `{project_id}.{dataset}.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '{start}' AND '{end}'
+```
+
+- If a segment column is NULL on > ~5% of rows, report it as a data gap, don't
+  pretend the segment covers the whole funnel.
+- A column that is only populated on a specific event (e.g. `traffic_source`
+  filled only on `session_start`) still works for session-scoped segmentation
+  if you take it via `ANY_VALUE`/`MAX` per session — but say so in the output.
+- `(not set)`/`(unknown)`/empty values are a segment of their own, not missing
+  data — report them explicitly, never drop them (dropping overstates rates).
+
 ## Workflow
 
 1. **Quality gate**: run the duplicate / null-key / session-integrity checks from `ga4-events`. Record PASS/FAIL. If the dup rate > 0.5%, run every segment query in this skill against the `events_dedup` CTE (replace the `FROM events_*` clause with `FROM events_dedup`). Never compare segments on unclean data.
 2. **Cost-safe setup**: date-window filter on `_TABLE_SUFFIX`, dry-run, `--maximum_bytes_billed`. Same rules as `ga4-events`.
 3. **Baseline**: compute the unfiltered session funnel (from `ga4-events`) so every segment can be compared against it.
-4. **Segment funnel** — one query per segment dimension, funnel per session:
+4. **Segment funnel** — one query per segment dimension, funnel per session.
+   Ecommerce steps shown; for `{property_type} = saas` substitute the SaaS
+   macro-funnel steps (`sign_up` → `pricing_view` → `start_trial` →
+   `subscribe`) from `sql-templates.md` §8:
    ```sql
    WITH per_session AS (
      SELECT

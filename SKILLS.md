@@ -28,6 +28,15 @@ All three share a **standardized report format**:
 | Flat events table (`event_type`, `session_id`, `sequence_number`, `uri`) | `ga4-events` adapted (it has the generic templates) |
 | Anything else / unknown schema | Start with `ga4-tracking-audit`; run the schema check first |
 
+The skills work on **ecommerce or SaaS** GA4 exports. Set
+`{property_type} = ecommerce | saas` once per run; it selects the funnel steps
+and the expected-param scoring matrix (ecommerce: `view_item` →
+`add_to_cart` → `purchase`; SaaS: `sign_up` → `pricing_view` → `start_trial`
+→ `subscribe`). Both branches share the same quality gate, dedupe, and
+coverage machinery — only the event lists differ. Always adapt to the
+property's *actual* event names from the inventory; the templates are
+starting points, not a spec.
+
 **Recommended pipeline (always):** audit the data's trustworthiness *before*
 reporting funnels — every defect in the data silently corrupts the funnel and
 segment numbers.
@@ -88,7 +97,7 @@ $env:Path = "$env:LOCALAPPDATA\Google\Cloud SDK\google-cloud-sdk\bin;" + $env:Pa
 
 | Skill | Parameters |
 | --- | --- |
-| `ga4-tracking-audit` / `ga4-events` | `{project_id}`, `{dataset}`, `{start}`/`{end}` (YYYYMMDD) |
+| `ga4-tracking-audit` / `ga4-events` | `{project_id}`, `{dataset}`, `{start}`/`{end}` (YYYYMMDD), `{property_type}` (`ecommerce`/`saas`) |
 | `ga4-segmentation` | same + `{segment_dim}` (source / device / geo / new vs returning) |
 
 ### 6. Known data quirks to watch for (learned from real runs)
@@ -99,12 +108,25 @@ $env:Path = "$env:LOCALAPPDATA\Google\Cloud SDK\google-cloud-sdk\bin;" + $env:Pa
 - **Zero-param counts hide partial tracking.** Events can fire but carry no
   `items`/`value`/`currency` (e.g. a checkout step with 0% items). The
   coverage matrix in `ga4-tracking-audit` catches this.
+- **`value` can be any numeric param type.** Check `int_value` +
+  `float_value` + `double_value` (and the `event_value_in_usd` column in newer
+  exports) — reading only one type under-reports purchase value by 30%+.
+- **`ecommerce.transaction_id` can be a constant placeholder.** On
+  `ga4_obfuscated_sample_ecommerce` it's the *same value on every event*
+  (cardinality 1) except on `purchase`. The §3b hygiene check catches this —
+  never count it as real transaction coverage.
 - **Attribution artifacts:** `(data deleted)`, `(not set)`, `<Other>` sources
   and self-referral domains show inflated conversion — flag as noise, not wins.
 - **Flat segments are a finding.** If all segments deviate < ~2pp from
   baseline, the problem is site-wide, not segment-specific.
-- **Synthetic/template data** can have rigid session shapes — verify session
-  patterns before trusting "behavioral" conclusions.
+- **Synthetic/template data** can have rigid session shapes and inflated
+  `items`-array lengths (e.g. `add_to_cart` avg 11 items on the sample) —
+  verify session patterns and item cardinality before trusting "behavioral"
+  conclusions.
+- **High step-through is a red flag.** A mid-funnel step retaining >90% of the
+  previous step (e.g. cart→checkout) usually fires on page load, not on the
+  user action — check the event's trigger before reporting it as a conversion
+  step.
 
 ## When the Gastronomixs data becomes available
 
