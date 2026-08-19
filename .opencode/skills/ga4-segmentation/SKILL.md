@@ -1,6 +1,6 @@
 ---
 name: ga4-segmentation
-description: Segment GA4 raw BigQuery export data by traffic source, device, geo, browser, platform, or new/returning users and run the funnel and event analytics per segment to find patterns and differences. Produces a standardized report (quality gate, baseline funnel, segment x funnel tables, event recommendations for segmentation, data gaps and suggested improvements). Use when the user asks for segmentation, segment comparison, segment funnel, which segments perform or convert better, or segment-level data gaps.
+description: Segment GA4 raw BigQuery export data by traffic source, device, geo, browser, platform, or new/returning users and run the funnel and event analytics per segment to find patterns and differences. Produces a standardized report (quality gate, baseline funnel, segment x funnel tables, event recommendations for segmentation, data gaps and suggested improvements). Fully data-driven: the funnel steps are discovered from the export, not hardcoded. Use when the user asks for segmentation, segment comparison, segment funnel, which segments perform or convert better, or segment-level data gaps.
 ---
 
 # GA4 Segmentation Analysis
@@ -9,15 +9,19 @@ Run the same funnel and event analytics as `ga4-events`, but sliced by
 segment dimensions, to find which segments over-/under-perform and where
 each segment leaks in the funnel.
 
-Depends on the `ga4-events` skill for the reference schema, funnel
-definition, event classification, and cost-safety rules. Load `ga4-events`
-first and reuse its templates and event inventory.
+Depends on the `ga4-events` skill for the discovery workflow, role vocabulary,
+funnel definition, event classification, and cost-safety rules. Load
+`ga4-events` first and reuse its discovery output (inventory, param map, role
+mapping). **The funnel steps are the discovered step events from `ga4-events`
+— never hardcoded.** SQL and thresholds come from **`../sql-templates.md`**
+(shared templates in the `skills/` folder) — §1 (discovery), §2 (quality
+gate), §5 (funnel templates), §4 (role vocabulary) are the source of truth.
 
 ## Parameters
 
 Same as `ga4-events`: `{project_id}`, `{dataset}`, `{table}`, `{start}`,
-`{end}`, `{property_type}` (ecommerce/saas). Plus `{segment_dim}` — one of the
-segment columns below.
+`{end}`, `{property_type}` (optional, inferred). Plus `{segment_dim}` — one of
+the segment columns below.
 
 ## Segment dimensions (default GA4 export)
 
@@ -50,25 +54,29 @@ WITH per_session AS (
     IF((SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_number') = 1,
        'new', 'returning') AS segment,
     (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS session_id,
-    MAX(IF(event_name = 'view_item', 1, 0)) AS s2,
-    MAX(IF(event_name = 'add_to_cart', 1, 0)) AS s3,
-    MAX(IF(event_name = 'begin_checkout', 1, 0)) AS s4,
-    MAX(IF(event_name = 'purchase', 1, 0)) AS s6
+    MAX(IF(event_name = 'session_start', 1, 0)) AS s1,
+    MAX(IF(event_name = '{step2}', 1, 0)) AS s2,
+    MAX(IF(event_name = '{step3}', 1, 0)) AS s3,
+    MAX(IF(event_name = '{step4}', 1, 0)) AS s4,
+    MAX(IF(event_name = '{step5}', 1, 0)) AS s5,
+    MAX(IF(event_name = '{step6}', 1, 0)) AS s6
   FROM `{project_id}.{dataset}.events_*`
   WHERE _TABLE_SUFFIX BETWEEN '{start}' AND '{end}'
   GROUP BY segment, session_id
 )
 SELECT segment, COUNT(*) AS sessions,
-  ROUND(100 * SUM(s2)/COUNT(*), 1) AS view_rate,
-  ROUND(100 * SUM(s3)/COUNT(*), 1) AS atc_rate,
-  ROUND(100 * SUM(s4)/COUNT(*), 1) AS checkout_rate,
-  ROUND(100 * SUM(s6)/COUNT(*), 1) AS purchase_rate,
-  ROUND(100 * SUM(s3)/SUM(s2), 1) AS vi_to_atc,
-  ROUND(100 * SUM(s6)/SUM(s4), 1) AS ck_to_purchase
+  ROUND(100 * SUM(s2)/COUNT(*), 1) AS step2_rate,
+  ROUND(100 * SUM(s3)/COUNT(*), 1) AS step3_rate,
+  ROUND(100 * SUM(s4)/COUNT(*), 1) AS step4_rate,
+  ROUND(100 * SUM(s5)/COUNT(*), 1) AS step5_rate,
+  ROUND(100 * SUM(s6)/COUNT(*), 1) AS step6_rate,
+  ROUND(100 * SUM(s3)/SUM(s2), 1) AS step2_to_step3,
+  ROUND(100 * SUM(s6)/SUM(s4), 1) AS step4_to_step6
 FROM per_session GROUP BY segment ORDER BY sessions DESC
 ```
 
-Fallback if `ga_session_number` is absent: compare
+`{step2}` … `{step6}` are the **discovered funnel step events** from
+`ga4-events`. Fallback if `ga_session_number` is absent: compare
 `event_timestamp - user_first_touch_timestamp` (first session < 30 min since
 first touch ≈ new) — label the result as approximate.
 
@@ -99,43 +107,27 @@ WHERE _TABLE_SUFFIX BETWEEN '{start}' AND '{end}'
 
 ## Workflow
 
-1. **Quality gate**: run the duplicate / null-key / session-integrity checks from `ga4-events`. Record PASS/FAIL. If the dup rate > 0.5%, run every segment query in this skill against the `events_dedup` CTE (replace the `FROM events_*` clause with `FROM events_dedup`). Never compare segments on unclean data.
-2. **Cost-safe setup**: date-window filter on `_TABLE_SUFFIX`, dry-run, `--maximum_bytes_billed`. Same rules as `ga4-events`.
-3. **Baseline**: compute the unfiltered session funnel (from `ga4-events`) so every segment can be compared against it.
-4. **Segment funnel** — one query per segment dimension, funnel per session.
-   Ecommerce steps shown; for `{property_type} = saas` substitute the SaaS
-   macro-funnel steps (`sign_up` → `pricing_view` → `start_trial` →
-   `subscribe`) from `sql-templates.md` §8:
-   ```sql
-   WITH per_session AS (
-     SELECT
-       {segment_dim} AS segment,
-       (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS session_id,
-       MAX(IF(event_name = 'session_start', 1, 0)) AS s1,
-       MAX(IF(event_name = 'view_item', 1, 0)) AS s2,
-       MAX(IF(event_name = 'add_to_cart', 1, 0)) AS s3,
-       MAX(IF(event_name = 'begin_checkout', 1, 0)) AS s4,
-       MAX(IF(event_name = 'add_payment_info', 1, 0)) AS s5,
-       MAX(IF(event_name = 'purchase', 1, 0)) AS s6
-     FROM `{project_id}.{dataset}.events_*`
-     WHERE _TABLE_SUFFIX BETWEEN '{start}' AND '{end}'
-     GROUP BY segment, session_id
-   )
-   SELECT segment,
-     COUNT(*) AS sessions,
-     SAFE_DIVIDE(SUM(s2), COUNT(*)) AS view_item_rate,
-     SAFE_DIVIDE(SUM(s3), COUNT(*)) AS add_to_cart_rate,
-     SAFE_DIVIDE(SUM(s4), COUNT(*)) AS begin_checkout_rate,
-     SAFE_DIVIDE(SUM(s5), COUNT(*)) AS add_payment_info_rate,
-     SAFE_DIVIDE(SUM(s6), COUNT(*)) AS purchase_rate,
-     SAFE_DIVIDE(SUM(s6), SUM(s4)) AS cart_to_purchase_rate
-   FROM per_session
-   GROUP BY segment
-   ORDER BY COUNT(*) DESC
-   ```
-   Drop/rename funnel steps to match the events that actually exist (from the event inventory in `ga4-events`).
-5. **Drop-off per segment**: for each segment compute step-to-step drop-off and compare against the baseline (e.g. segment is 15% worse than baseline at `add_to_cart`). Flag segments that leak at a *specific* step, not uniformly.
-6. **Composition analysis** (who converts vs who doesn't):
+1. **Discover + quality gate**: reuse `ga4-events` discovery (inventory, param
+   map, role mapping, property-type inference) and quality-gate result. Record
+   PASS/FAIL. If the dup rate > 0.5%, run every segment query against the
+   `events_dedup` CTE (replace the `FROM events_*` clause with `FROM
+   events_dedup`). Never compare segments on unclean data.
+2. **Cost-safe setup**: date-window filter on `_TABLE_SUFFIX`, dry-run,
+   `--maximum_bytes_billed`. Same rules as `ga4-events`.
+3. **Baseline**: compute the unfiltered session funnel from the **discovered**
+   step events (from `ga4-events` §5b) so every segment can be compared against
+   it.
+4. **Segment funnel** — one query per segment dimension, funnel per session,
+   using the discovered step events (template above). For SaaS, also run the
+   **user-level funnel per segment** (reference §5c) keyed on `user_id` when
+   populated — SaaS conversions span sessions.
+5. **Drop-off per segment**: for each segment compute step-to-step drop-off and
+   compare against the baseline (e.g. segment is 15% worse than baseline at a
+   mid step). Flag segments that leak at a *specific* step, not uniformly.
+6. **Composition analysis** (who converts vs who doesn't) — uses the
+   discovered conversion event(s) (`subscribe`/`purchase` role), never a fixed
+   name:
+
    ```sql
    WITH t AS (
      SELECT {segment_dim} AS segment, event_name, user_pseudo_id
@@ -144,15 +136,16 @@ WHERE _TABLE_SUFFIX BETWEEN '{start}' AND '{end}'
    )
    SELECT segment,
      COUNT(DISTINCT user_pseudo_id) AS users,
-     COUNT(DISTINCT IF(event_name = 'purchase', user_pseudo_id, NULL)) AS purchasers,
-     SAFE_DIVIDE(COUNT(DISTINCT IF(event_name = 'purchase', user_pseudo_id, NULL)),
+     COUNT(DISTINCT IF(event_name = '{conv_event}', user_pseudo_id, NULL)) AS converters,
+     SAFE_DIVIDE(COUNT(DISTINCT IF(event_name = '{conv_event}', user_pseudo_id, NULL)),
                  COUNT(DISTINCT user_pseudo_id)) AS conv_rate
     FROM t GROUP BY segment ORDER BY users DESC
    ```
+
    Identity note: this counts cookies (`user_pseudo_id`), not people — state
    that whenever `user_id` is empty. For a lookup-style table where `user_id`
-   only exists on buyers (e.g. thelook), user-level conversion is meaningless;
-   fall back to session-level funnels only.
+   only exists on buyers, user-level conversion is meaningless; fall back to
+   session-level funnels only.
 7. **Interpretation guardrails**:
    - small-segment caution: flag segments with fewer than ~100 sessions in the window — rates are noise;
    - segments correlate with intent (e.g. Paid Search usually higher intent than Social) — don't call one channel "better" without controlling for mix;
@@ -167,38 +160,35 @@ WHERE _TABLE_SUFFIX BETWEEN '{start}' AND '{end}'
 Produce the report in this fixed order with these headers:
 
 1. `Quality gate` — PASS/FAIL + dup rate + null-key shares (reuse `ga4-events`).
-2. `Baseline funnel` — the unfiltered session funnel every segment is compared against.
-3. `Segment x funnel` — one table per segment dimension: `segment | sessions | step rates | cart_to_purchase | deviation vs baseline`.
+2. `Baseline funnel` — the unfiltered session funnel from discovered step events, every segment compared against it.
+3. `Segment x funnel` — one table per segment dimension: `segment | sessions | step rates | step_to_step | deviation vs baseline`.
 4. `Best & worst segments` — the 2-3 over- and under-performers and at which step (or state explicitly when segments are flat).
-5. `Recommendations (events)` — tracking/event changes that would make segmentation stronger.
+5. `Recommendations (events)` — tracking/event changes that would make segmentation stronger (suggested, tied to gaps).
 6. `Data gaps & suggested improvements` — schema gaps + concrete fixes.
 
-Keep `## Output format` guidance below as the template for sections 3-4:
-
-### Output format
+### Output format (sections 3-4)
 
 For each segment dimension:
 - a table of segment x funnel rates + deviation vs baseline;
 - the 2-3 segments that over- and under-perform, and at which step;
-- practical implication (e.g. "Email converts 2x baseline at checkout — test a checkout change first for Email users" or "Mobile leaks at begin_checkout — checkout UX on mobile is the priority");
+- practical implication (e.g. "Email converts 2x baseline at checkout — test a checkout change first for Email users" or "Mobile leaks at checkout — mobile UX is the priority");
 - if every segment deviates < ~2pp from baseline, say so explicitly — flat data means site-wide problems, not segment problems.
 
 ## Event recommendations (to strengthen segmentation)
 
 **Add** (tie each to a segment gap found above):
 
-- `begin_checkout` / `add_payment_info` per segment — required to localize a
-  checkout leak to a device/geo/channel (the biggest missing step when
-  cart->purchase leaks).
+- missing checkout steps per segment — required to localize a checkout leak to
+  a device/geo/channel (the biggest missing step when cart→purchase leaks);
 - `user_id` param on all events — without it a returning user is a new
   `user_pseudo_id` on every device, so device segments look like different
-  people (breaks new/returning and cross-device segments).
-- `transaction_id` + `value` + `currency` on `purchase` per segment — revenue
-  per segment is impossible without them.
+  people (breaks new/returning and cross-device segments);
+- `transaction_id` + `value` + `currency` on conversion events per segment —
+  revenue per segment is impossible without them;
 - `promotion_id`/`creative_name` on promotion events — isolates campaign-level
-  segment performance.
-- `item_category` on all commerce events — enables segment x category analysis.
-- For "new vs returning" segments, ensure `user_first_touch_timestamp` and
+  segment performance;
+- `item_category` on all product events — enables segment x category analysis;
+- for "new vs returning" segments, ensure `user_first_touch_timestamp` and
   `user_engagement` are populated; otherwise derive recency from the data
   you have and label it as an approximation.
 
@@ -214,7 +204,7 @@ For each segment dimension:
 
 - **Identity is cookie-scoped**: `user_pseudo_id` fragments cross-device users;
   device segments double-count the same person. Suggested: enable Google
-  Signals or pass `user_id` on login.
+  Signals or pass `user_id` on login (for SaaS this is a defect, not a note).
 - **Attribution is single-touch**: the segment is taken from the session-start
   event; conversions later in the session inherit that touch. Suggested: record
   `source`/`medium` on the converting event itself for last-click accuracy.
