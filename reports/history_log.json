@@ -1,0 +1,26 @@
+[
+  {
+    "run_date": "2026-08-20 04:50:41",
+    "baseline": {
+      "cancel_rate": "0.1070378512965857",
+      "cart_rate": "0.7807988769104443",
+      "cart_to_purchase_rate": "0.7163768976337885",
+      "product_to_purchase_rate": "0.5609137392921176",
+      "product_view_rate": "0.9972055200911186",
+      "purchase_rate": "0.5593462771170503",
+      "sessions": "75506"
+    }
+  },
+  {
+    "run_date": "2026-08-20 04:55:01",
+    "baseline": {
+      "cancel_rate": "0.1070378512965857",
+      "cart_rate": "0.7807988769104443",
+      "cart_to_purchase_rate": "0.7163768976337885",
+      "product_to_purchase_rate": "0.5609137392921176",
+      "product_view_rate": "0.9972055200911186",
+      "purchase_rate": "0.5593462771170503",
+      "sessions": "75506"
+    }
+  }
+]

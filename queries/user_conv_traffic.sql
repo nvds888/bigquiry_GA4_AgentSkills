@@ -6,9 +6,9 @@ WITH windowed AS (
 SELECT
   traffic_source AS segment,
   COUNT(DISTINCT user_id) AS users,
-  COUNT(DISTINCT IF(event_type = 'purchase', user_id, NULL)) AS purchasers,
+  COUNT(DISTINCT IF(event_type = '{final_step}', user_id, NULL)) AS converters,
   SAFE_DIVIDE(
-    COUNT(DISTINCT IF(event_type = 'purchase', user_id, NULL)),
+    COUNT(DISTINCT IF(event_type = '{final_step}', user_id, NULL)),
     COUNT(DISTINCT user_id)
   ) AS conv_rate
 FROM windowed
